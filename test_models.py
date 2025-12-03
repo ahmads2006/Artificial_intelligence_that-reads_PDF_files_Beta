@@ -1,7 +1,11 @@
+import os
 import google.generativeai as genai
 
 # إعداد API
-api_key = "GEMINI_API_KEY"
+from dotenv import load_dotenv
+load_dotenv()
+
+api_key = os.getenv("GEMINI_API_KEY")
 genai.configure(api_key=api_key)
 
 # قائمة النماذج المتاحة

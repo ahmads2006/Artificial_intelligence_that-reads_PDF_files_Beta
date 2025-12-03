@@ -1,6 +1,7 @@
 import PyPDF2
 import os
-from pathlib import Path
+from dotenv import load_dotenv
+load_dotenv()
 import google.generativeai as genai
 from typing import List, Optional
 
@@ -253,9 +254,9 @@ def interactive_mode():
     print("=" * 70)
 
     # Automatic API setup
-    api_key = "GEMINI_API_KEY"
+    api_key = os.getenv("GEMINI_API_KEY") or "########################"
     print("🔑 AI mode enabled automatically!")
-
+    
     qa = AIEnhancedPDFQA(api_key=api_key, use_ai=True)
 
     # Load default PDF automatically
