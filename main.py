@@ -253,7 +253,7 @@ def interactive_mode():
     print("=" * 70)
 
     # Automatic API setup
-    api_key = "AIzaSyCw0kuoadN9sKRjVF6VOZrYc2PCfwxsD2k"
+    api_key = "GEMINI_API_KEY"
     print("🔑 AI mode enabled automatically!")
 
     qa = AIEnhancedPDFQA(api_key=api_key, use_ai=True)

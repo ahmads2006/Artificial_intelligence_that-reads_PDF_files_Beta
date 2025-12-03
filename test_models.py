@@ -1,7 +1,7 @@
 import google.generativeai as genai
 
 # إعداد API
-api_key = "AIzaSyCw0kuoadN9sKRjVF6VOZrYc2PCfwxsD2k"
+api_key = "GEMINI_API_KEY"
 genai.configure(api_key=api_key)
 
 # قائمة النماذج المتاحة
