@@ -60,7 +60,7 @@ RGPAI_project/
 ### تغيير API Key
 في ملف `main.py`، غيّر السطر:
 ```python
-api_key = "AIzaSyCw0kuoadN9sKRjVF6VOZrYc2PCfwxsD2k"
+api_key = "#############"
 ```
 
 ### تغيير ملف PDF الافتراضي
