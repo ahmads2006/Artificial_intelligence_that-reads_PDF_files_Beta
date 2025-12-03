@@ -1,0 +1,11 @@
+PyPDF2
+google-generativeai
+sentence-transformers
+faiss-cpu
+transformers
+torch
+openai
+langchain
+langchain-community
+langchain-openai
+langchain-core
