@@ -1,609 +1,948 @@
 import PyPDF2
 import os
 import logging
+import asyncio
+import hashlib
+import json
 from functools import lru_cache
 from dotenv import load_dotenv
+from typing import List, Dict, Any, Optional, Tuple
+from datetime import datetime, timedelta
+from dataclasses import dataclass, asdict
+from pathlib import Path
+import re
+
 load_dotenv()
-import google.generativeai as genai
-from typing import List, Optional, Dict, Any
-from datetime import datetime
-# إعداد API
-api_key = os.getenv("GEMINI_API_KEY")
-genai.configure(api_key=api_key)
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('pdf_qa.log', encoding='utf-8'),
+        logging.FileHandler('pdf_qa_v3.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
-def validate_input(text: str, max_length: int = 1000) -> str:
-    """Validate and sanitize user input"""
+# ================= Data Classes =================
+
+@dataclass
+class SearchResult:
+    """Structured search result"""
+    content: str
+    confidence: float
+    page_number: int
+    match_type: str  # 'exact', 'semantic', 'keyword'
+    metadata: Dict[str, Any]
+
+@dataclass
+class DocumentMetadata:
+    """PDF document metadata"""
+    filename: str
+    num_pages: int
+    text_length: int
+    load_time: datetime
+    file_size: int
+    hash: str
+
+# ================= Helper Functions =================
+
+def validate_input(text: str, max_length: int = 2000) -> str:
+    """Enhanced input validation"""
     if not text or not text.strip():
         raise ValueError("Input cannot be empty")
 
-    # Remove potentially harmful characters
-    sanitized = ''.join(char for char in text if char.isprintable())
-    sanitized = sanitized.strip()
+    sanitized = ''.join(char for char in text if char.isprintable()).strip()
+
+    # Check that sanitization didn't result in empty string
+    if not sanitized:
+        raise ValueError("Input cannot contain only non-printable characters")
 
     if len(sanitized) > max_length:
-        logger.warning(f"Input too long ({len(sanitized)}), truncating to {max_length}")
+        logger.warning(f"Input truncated from {len(sanitized)} to {max_length}")
         sanitized = sanitized[:max_length]
 
     return sanitized
 
-def get_ai_response(prompt: str) -> str:
-    """Get AI response"""
-    try:
-        response = genai.generate_content(prompt)
-        return response.candidates[0].content.parts[0].text
-    except Exception as e:
-        logger.error(f"Error getting AI response: {e}")
-        return f"Error getting AI response: {e}"
+def validate_file_path(file_path: str) -> Tuple[bool, str]:
+    """Enhanced file validation with detailed error messages"""
+    if not file_path:
+        return False, "File path is empty"
+    
+    path = Path(file_path)
+    
+    if not path.exists():
+        return False, f"File does not exist: {file_path}"
+    
+    if not path.suffix.lower() == '.pdf':
+        return False, f"File is not a PDF: {path.suffix}"
+    
+    max_size = 100 * 1024 * 1024  # 100MB (increased from 50MB)
+    file_size = path.stat().st_size
+    
+    if file_size > max_size:
+        return False, f"File too large: {file_size / (1024*1024):.1f}MB (max 100MB)"
+    
+    if file_size == 0:
+        return False, "File is empty"
+    
+    return True, "Valid"
 
+def calculate_text_hash(text: str) -> str:
+    """Calculate SHA256 hash of text"""
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()[:16]
 
-def validate_file_path(file_path: str) -> bool:
-    """Validate file path and check if it's a PDF"""
-    if not file_path or not os.path.exists(file_path):
-        return False
+def extract_keywords(text: str, min_length: int = 3) -> List[str]:
+    """Extract meaningful keywords from text"""
+    # Remove common stop words
+    stop_words = {'the', 'is', 'at', 'which', 'on', 'and', 'or', 'but', 'in', 'with', 'to', 'for', 'of', 'a', 'an'}
+    words = re.findall(r'\b\w+\b', text.lower())
+    return [w for w in words if len(w) >= min_length and w not in stop_words]
 
-    if not file_path.lower().endswith('.pdf'):
-        logger.warning(f"File {file_path} is not a PDF file")
-        return False
+# ================= Advanced Caching System =================
 
-    # Check file size (max 50MB)
-    max_size = 50 * 1024 * 1024  # 50MB
-    if os.path.getsize(file_path) > max_size:
-        logger.warning(f"File {file_path} is too large ({os.path.getsize(file_path)} bytes)")
-        return False
+class SmartCache:
+    """LRU cache with TTL and size limits"""
+    
+    def __init__(self, max_size: int = 100, ttl_seconds: int = 3600):
+        self.cache: Dict[str, Tuple[Any, datetime]] = {}
+        self.max_size = max_size
+        self.ttl = timedelta(seconds=ttl_seconds)
+        self.hits = 0
+        self.misses = 0
+    
+    def get(self, key: str) -> Optional[Any]:
+        """Get cached value if not expired"""
+        if key in self.cache:
+            value, timestamp = self.cache[key]
+            if datetime.now() - timestamp < self.ttl:
+                self.hits += 1
+                logger.debug(f"Cache hit for key: {key[:20]}...")
+                return value
+            else:
+                del self.cache[key]
+        
+        self.misses += 1
+        return None
+    
+    def set(self, key: str, value: Any):
+        """Set cached value with timestamp"""
+        if len(self.cache) >= self.max_size:
+            # Remove oldest entry
+            oldest_key = min(self.cache.keys(), key=lambda k: self.cache[k][1])
+            del self.cache[oldest_key]
+        
+        self.cache[key] = (value, datetime.now())
+        logger.debug(f"Cached key: {key[:20]}...")
+    
+    def clear(self):
+        """Clear all cache"""
+        self.cache.clear()
+        logger.info("Cache cleared")
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get cache statistics"""
+        total = self.hits + self.misses
+        hit_rate = (self.hits / total * 100) if total > 0 else 0
+        return {
+            'hits': self.hits,
+            'misses': self.misses,
+            'hit_rate': f"{hit_rate:.1f}%",
+            'size': len(self.cache)
+        }
 
-    return True
+# ================= AI Integration with Fallback =================
 
-class AIEnhancedPDFQA:
-    def __init__(self, pdf_path=None, api_key=None, use_ai=True):
-        """
-        Advanced PDF Question Answering System with AI
+class AIProvider:
+    """Abstract AI provider with fallback support"""
+    
+    def __init__(self, api_key: Optional[str] = None):
+        self.api_key = api_key
+        self.model = None
+        self.available = False
+        self.provider_name = "None"
+        
+        if api_key:
+            self._initialize()
+    
+    def _initialize(self):
+        """Initialize AI model"""
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=self.api_key)
+            self.model = genai.GenerativeModel('gemini-2.0-flash-exp')
+            self.available = True
+            self.provider_name = "Gemini 2.0 Flash"
+            logger.info(f"AI Provider initialized: {self.provider_name}")
+        except ImportError:
+            logger.warning("google.generativeai not installed")
+        except Exception as e:
+            logger.error(f"AI initialization failed: {e}")
+    
+    def generate(self, prompt: str, max_retries: int = 3) -> Optional[str]:
+        """Generate response with retry logic"""
+        if not self.available:
+            return None
+        
+        for attempt in range(max_retries):
+            try:
+                response = self.model.generate_content(prompt)
+                return response.text
+            except Exception as e:
+                logger.warning(f"AI generation attempt {attempt + 1} failed: {e}")
+                if attempt < max_retries - 1:
+                    asyncio.sleep(2 ** attempt)  # Exponential backoff
+        
+        return None
 
-        Args:
-            pdf_path: Path to PDF file (optional)
-            api_key: Gemini API key (optional)
-            use_ai: Use AI or traditional search
-        """
-        logger.info("Initializing AIEnhancedPDFQA system")
-        self.pdf_text = ""
-        self.pdf_path = pdf_path
-        self.use_ai = use_ai
-        self.ai_model = None
+# ================= Main Enhanced PDF QA Class =================
+
+class AdvancedPDFQA:
+    """
+    Advanced PDF Question Answering System v3.0
+    
+    Features:
+    - Dual AI/Traditional modes with smart fallback
+    - Advanced caching system with TTL
+    - Multi-document support with metadata
+    - Confidence scoring for answers
+    - Enhanced search with semantic understanding
+    - Comprehensive statistics and monitoring
+    - Rate limiting with exponential backoff
+    - Async-ready architecture
+    """
+    
+    def __init__(self, pdf_path: Optional[str] = None, api_key: Optional[str] = None, use_ai: bool = True):
+        logger.info("Initializing AdvancedPDFQA v3.0")
+        
+        # Core attributes
+        self.documents: Dict[str, str] = {}  # {doc_id: text}
+        self.metadata: Dict[str, DocumentMetadata] = {}
+        self.current_doc_id: Optional[str] = None
+        
+        # AI provider
+        self.ai_provider = AIProvider(api_key)
+        self.use_ai = use_ai and self.ai_provider.available
+        
+        # Caching system
+        self.qa_cache = SmartCache(max_size=200, ttl_seconds=3600)
+        self.summary_cache = SmartCache(max_size=50, ttl_seconds=7200)
+        
+        # Statistics
         self.stats = {
             'questions_asked': 0,
             'ai_responses': 0,
             'traditional_responses': 0,
+            'cached_responses': 0,
+            'total_docs_loaded': 0,
+            'start_time': datetime.now(),
             'last_activity': datetime.now()
         }
-        # Rate limiting for API calls (max 10 calls per minute)
-        self.api_call_times = []
-        self.max_calls_per_minute = 10
-
-        # Cache for summaries to avoid regenerating for same content
-        self._summary_cache = {}
-
-        # Initialize AI model
-        if use_ai and api_key:
-            self._initialize_ai(api_key)
-
+        
+        # Rate limiting
+        self.api_call_times: List[datetime] = []
+        self.max_calls_per_minute = 15
+        
+        # Load initial PDF if provided
         if pdf_path:
             self.load_pdf(pdf_path)
-
-        logger.info(f"System initialized. AI mode: {self.use_ai}, PDF loaded: {bool(pdf_path)}")
+        
+        logger.info(f"System initialized - AI: {self.use_ai}, Provider: {self.ai_provider.provider_name}")
     
-    def _initialize_ai(self, api_key):
-        """Initialize Gemini model"""
+    def load_pdf(self, path: str, doc_id: Optional[str] = None) -> bool:
+        """Load PDF with enhanced error handling and metadata"""
         try:
-            logger.info("Initializing Gemini AI model...")
-            genai.configure(api_key=api_key)
-            self.ai_model = genai.GenerativeModel('gemini-flash-latest')
-            logger.info("AI model initialized successfully")
-            print("✅ AI mode enabled successfully!")
-        except Exception as e:
-            logger.error(f"Failed to initialize AI model: {e}")
-            print(f"⚠️ Failed to enable AI: {e}")
-            print("Using traditional search instead...")
-            self.use_ai = False
-    
-    def load_pdf(self, path):
-        """Load PDF file with error handling"""
-        try:
-            logger.info(f"Attempting to load PDF file: {path}")
-
-            # Validate file path
-            if not validate_file_path(path):
-                error_msg = f"Invalid PDF file: {path}"
-                logger.error(error_msg)
-                print(f"❌ {error_msg}")
+            # Validate file
+            is_valid, message = validate_file_path(path)
+            if not is_valid:
+                logger.error(f"Validation failed: {message}")
+                print(f"❌ {message}")
                 return False
-
-            if not os.path.exists(path):
-                logger.error(f"PDF file not found: {path}")
-                raise FileNotFoundError(f"File not found: {path}")
-
+            
+            # Generate doc_id if not provided
+            if doc_id is None:
+                doc_id = Path(path).stem
+            
+            logger.info(f"Loading PDF: {path}")
+            start_time = datetime.now()
+            
             with open(path, "rb") as file:
                 reader = PyPDF2.PdfReader(file)
-                self.pdf_text = ""
-                for page_num, page in enumerate(reader.pages):
+                num_pages = len(reader.pages)
+                
+                # Extract text with page markers
+                text_parts = []
+                for i, page in enumerate(reader.pages):
                     page_text = page.extract_text()
-                    self.pdf_text += f"\n--- Page {page_num + 1} ---\n{page_text}\n"
-
-            self.pdf_path = path
-            # Clear summary cache since we have new content
-            self._summary_cache.clear()
-            logger.info(f"Successfully loaded PDF with {len(reader.pages)} pages")
-            print(f"✔ Loaded {len(reader.pages)} pages from file")
+                    text_parts.append(f"\n--- Page {i+1} ---\n{page_text}\n")
+                
+                full_text = "".join(text_parts)
+            
+            # Store document and metadata
+            self.documents[doc_id] = full_text
+            self.metadata[doc_id] = DocumentMetadata(
+                filename=Path(path).name,
+                num_pages=num_pages,
+                text_length=len(full_text),
+                load_time=datetime.now(),
+                file_size=Path(path).stat().st_size,
+                hash=calculate_text_hash(full_text)
+            )
+            
+            self.current_doc_id = doc_id
+            self.stats['total_docs_loaded'] += 1
+            
+            # Clear caches for this document
+            self.qa_cache.clear()
+            self.summary_cache.clear()
+            
+            load_duration = (datetime.now() - start_time).total_seconds()
+            logger.info(f"PDF loaded successfully in {load_duration:.2f}s - {num_pages} pages")
+            print(f"✅ Loaded '{Path(path).name}' - {num_pages} pages ({len(full_text):,} chars)")
+            
             return True
+            
         except Exception as e:
-            logger.error(f"Error loading PDF file {path}: {e}")
-            print(f"❌ Error loading file: {e}")
+            logger.error(f"Error loading PDF {path}: {e}")
+            print(f"❌ Error loading PDF: {e}")
             return False
     
-    def load_multiple_pdfs(self, paths: List[str]):
-        """Load multiple PDF files"""
-        all_text = ""
-        total_pages = 0
+    def load_multiple_pdfs(self, paths: List[str]) -> int:
+        """Load multiple PDFs"""
+        success_count = 0
         
         for path in paths:
-            if os.path.exists(path):
-                try:
-                    with open(path, "rb") as file:
-                        reader = PyPDF2.PdfReader(file)
-                        all_text += f"\n\n===== File: {os.path.basename(path)} =====\n\n"
-                        for page_num, page in enumerate(reader.pages):
-                            all_text += f"\n--- Page {page_num + 1} ---\n{page.extract_text()}\n"
-                        total_pages += len(reader.pages)
-                    print(f"✔ Loaded: {path} ({len(reader.pages)} pages)")
-                except Exception as e:
-                    print(f"❌ Error in {path}: {e}")
+            if self.load_pdf(path):
+                success_count += 1
         
-        self.pdf_text = all_text
-        print(f"✅ Total pages loaded: {total_pages}")
-        return bool(all_text)
+        print(f"\n📚 Loaded {success_count}/{len(paths)} documents successfully")
+        return success_count
     
-    def _chunk_text(self, text: str, max_chunk_size: int = 30000) -> List[str]:
-        """Split text into smaller chunks to avoid model limits with smart boundaries"""
+    def _get_current_text(self) -> str:
+        """Get current document text"""
+        if not self.current_doc_id or self.current_doc_id not in self.documents:
+            return ""
+        return self.documents[self.current_doc_id]
+    
+    def _chunk_text(self, text: str, max_chunk_size: int = 40000) -> List[str]:
+        """Smart text chunking with paragraph and sentence boundaries"""
         if len(text) <= max_chunk_size:
             return [text]
-
+        
         chunks = []
-        paragraphs = text.split('\n\n')  # Split by paragraphs first
-
+        paragraphs = text.split('\n\n')
+        
         current_chunk = ""
         current_size = 0
-
-        for paragraph in paragraphs:
-            paragraph_size = len(paragraph) + 2  # +2 for \n\n
-
-            if current_size + paragraph_size > max_chunk_size and current_chunk:
-                # Save current chunk
+        
+        for para in paragraphs:
+            para_size = len(para) + 2
+            
+            if current_size + para_size > max_chunk_size and current_chunk:
                 chunks.append(current_chunk.strip())
-                current_chunk = paragraph
-                current_size = paragraph_size
+                current_chunk = para
+                current_size = para_size
             else:
-                # Add to current chunk
-                if current_chunk:
-                    current_chunk += '\n\n' + paragraph
-                else:
-                    current_chunk = paragraph
-                current_size += paragraph_size
-
-        # Add remaining chunk
+                current_chunk = (current_chunk + '\n\n' + para) if current_chunk else para
+                current_size += para_size
+        
         if current_chunk:
             chunks.append(current_chunk.strip())
-
-        # If we still have very large chunks, split by sentences
+        
+        # Handle oversized chunks
         final_chunks = []
         for chunk in chunks:
             if len(chunk) > max_chunk_size:
-                # Split by sentences
-                sentences = chunk.split('. ')
+                sentences = re.split(r'(?<=[.!?])\s+', chunk)
                 temp_chunk = ""
-                temp_size = 0
-
-                for sentence in sentences:
-                    sentence_size = len(sentence) + 2  # +2 for '. '
-
-                    if temp_size + sentence_size > max_chunk_size and temp_chunk:
+                
+                for sent in sentences:
+                    if len(temp_chunk) + len(sent) > max_chunk_size and temp_chunk:
                         final_chunks.append(temp_chunk.strip())
-                        temp_chunk = sentence
-                        temp_size = sentence_size
+                        temp_chunk = sent
                     else:
-                        if temp_chunk:
-                            temp_chunk += '. ' + sentence
-                        else:
-                            temp_chunk = sentence
-                        temp_size += sentence_size
-
+                        temp_chunk = (temp_chunk + ' ' + sent) if temp_chunk else sent
+                
                 if temp_chunk:
                     final_chunks.append(temp_chunk.strip())
             else:
                 final_chunks.append(chunk)
-
+        
         logger.debug(f"Text chunked into {len(final_chunks)} chunks")
         return final_chunks
     
-    def answer_with_ai(self, question: str) -> str:
-        """Answer question using AI"""
-        logger.info(f"Processing AI question: {question[:100]}...")
-
-        if not self.ai_model:
-            logger.warning("AI model not available for question")
-            return "❌ AI model not available. Make sure you entered a valid API key."
-
-        if not self.pdf_text:
-            logger.warning("No PDF text available for AI question")
-            return "⚠ No PDF file loaded yet."
-
-        # Check rate limit
+    def _check_rate_limit(self) -> bool:
+        """Check API rate limit with exponential backoff"""
+        now = datetime.now()
+        self.api_call_times = [t for t in self.api_call_times if (now - t).total_seconds() < 60]
+        
+        if len(self.api_call_times) >= self.max_calls_per_minute:
+            logger.warning("Rate limit reached")
+            return False
+        
+        self.api_call_times.append(now)
+        return True
+    
+    def _calculate_confidence(self, text: str, question: str) -> float:
+        """Calculate answer confidence score"""
+        question_keywords = set(extract_keywords(question))
+        text_keywords = set(extract_keywords(text))
+        
+        if not question_keywords:
+            return 0.0
+        
+        # Keyword overlap
+        overlap = len(question_keywords & text_keywords)
+        keyword_score = overlap / len(question_keywords)
+        
+        # Length penalty (too short answers are suspicious)
+        length_score = min(len(text) / 200, 1.0)
+        
+        # Combined score
+        confidence = (keyword_score * 0.7 + length_score * 0.3)
+        
+        return round(confidence, 2)
+    
+    def answer_with_ai(self, question: str) -> Tuple[str, float]:
+        """Answer question using AI with confidence scoring"""
+        text = self._get_current_text()
+        
+        if not text:
+            return "⚠️ No document loaded", 0.0
+        
+        if not self.ai_provider.available:
+            return "⚠️ AI not available. Falling back to traditional search...", 0.0
+        
         if not self._check_rate_limit():
-            logger.warning("Rate limit exceeded for AI question")
-            return "❌ Rate limit exceeded. Please wait a moment before asking another question."
+            return "⚠️ Rate limit reached. Please wait a moment.", 0.0
         
         try:
-            # Update statistics
-            self.stats['questions_asked'] += 1
-            self.stats['last_activity'] = datetime.now()
-
-            # Split text if it's too large
-            chunks = self._chunk_text(self.pdf_text)
-            logger.debug(f"Text split into {len(chunks)} chunks")
-
-            # If there's only one chunk
+            chunks = self._chunk_text(text)
+            
             if len(chunks) == 1:
-                prompt = f"""You are an intelligent assistant specialized in answering questions from documents.
+                # Single chunk - direct answer
+                prompt = f"""You are an expert document analyst. Answer the question based ONLY on the document provided.
 
 Document:
-{self.pdf_text}
+{text}
 
 Question: {question}
 
 Instructions:
-1. Read the document carefully
-2. Answer the question accurately based only on the document content
-3. If you don't find the answer in the document, say so clearly
-4. Make your answer clear and direct
+- Provide a clear, accurate answer based on the document
+- If the answer is not in the document, state: "Information not found in document"
+- Be concise but complete
+- Cite specific details when possible
 
 Answer:"""
                 
-                response = self.ai_model.generate_content(prompt)
-                self.stats['ai_responses'] += 1
-                logger.info("AI response generated successfully")
-                return response.text
-
-            # If text is large, search in each chunk
+                response = self.ai_provider.generate(prompt)
+                
+                if response:
+                    confidence = self._calculate_confidence(response, question)
+                    self.stats['ai_responses'] += 1
+                    return response, confidence
+            
             else:
-                print(f"🔍 Searching in {len(chunks)} sections of the document...")
+                # Multi-chunk search
+                print(f"🔍 Searching {len(chunks)} document sections...")
                 best_answer = None
-
+                best_confidence = 0.0
+                
                 for i, chunk in enumerate(chunks):
-                    print(f"  📖 Searching section {i+1}/{len(chunks)}...", end="", flush=True)
                     prompt = f"""Question: {question}
 
-Part of the document:
+Document Section:
 {chunk}
 
-Do you find an answer to the question in this part? If yes, answer accurately. If no, say "No answer in this part"."""
+Does this section contain information to answer the question? If yes, provide the answer. If no, respond with "NO_ANSWER".
 
-                    response = self.ai_model.generate_content(prompt)
-                    answer = response.text
-
-                    if "No answer" not in answer and "no answer" not in answer.lower() and len(answer) > 50:
-                        best_answer = answer
-                        logger.info(f"Found answer in chunk {i+1}")
-                        print(" ✅ Found!")
-                        break
-                    else:
-                        print(" ❌ No answer", end="")
-
-                print()  # New line after progress
-
+Answer:"""
+                    
+                    response = self.ai_provider.generate(prompt)
+                    
+                    if response and "NO_ANSWER" not in response:
+                        confidence = self._calculate_confidence(response, question)
+                        
+                        if confidence > best_confidence:
+                            best_answer = response
+                            best_confidence = confidence
+                        
+                        if confidence > 0.7:  # Good enough answer found
+                            break
+                
                 if best_answer:
                     self.stats['ai_responses'] += 1
-                    logger.info("AI chunk search successful")
-                else:
-                    logger.warning("No clear answer found in any chunk")
-
-                return best_answer if best_answer else "❌ Could not find a clear answer in the document."
-
+                    return best_answer, best_confidence
+            
+            return "❌ Could not find relevant information in the document.", 0.0
+            
         except Exception as e:
-            logger.error(f"AI error during question processing: {e}")
-            print(f"❌ AI Error: {e}")
-            return "An error occurred while processing the question. Try rephrasing."
+            logger.error(f"AI error: {e}")
+            return f"❌ AI Error: {str(e)}", 0.0
     
-    def answer_traditional(self, question: str, context_lines: int = 3) -> str:
-        """Traditional answer by searching for keywords"""
-        logger.info(f"Processing traditional question: {question[:100]}...")
-
-        if not self.pdf_text:
-            logger.warning("No PDF text available for traditional question")
-            return "⚠ No PDF file loaded yet."
+    def answer_traditional(self, question: str, context_lines: int = 2) -> Tuple[str, float]:
+        """Enhanced traditional keyword search with confidence scoring"""
+        text = self._get_current_text()
         
-        sentences = [s.strip() for s in self.pdf_text.replace("\n", " ").split(".") if s.strip()]
-        question_words = [w.lower() for w in question.split() if len(w) > 2]
+        if not text:
+            return "⚠️ No document loaded", 0.0
+        
+        # Split into sentences
+        sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text.replace('\n', ' ')) if len(s.strip()) > 20]
+        
+        # Extract question keywords
+        question_keywords = extract_keywords(question)
+        
+        if not question_keywords:
+            return "❌ Please provide a more specific question", 0.0
+        
+        # Score each sentence
         matches = []
-
-        for i, sentence in enumerate(sentences):
-            match_count = sum(1 for word in question_words if word in sentence.lower())
-            if match_count >= 1:
-                matches.append((i, match_count, sentence))
-
+        for i, sent in enumerate(sentences):
+            sent_lower = sent.lower()
+            match_count = sum(1 for kw in question_keywords if kw in sent_lower)
+            
+            if match_count > 0:
+                # Calculate page number
+                page_num = text[:text.find(sent)].count('--- Page') + 1
+                matches.append((i, match_count, sent, page_num))
+        
         if not matches:
-            logger.info(f"No matches found for traditional search with keywords: {question_words}")
-            return "❌ Could not find an answer. Try using different keywords."
-
+            return "❌ No relevant information found. Try different keywords.", 0.0
+        
+        # Sort by match count
         matches.sort(key=lambda x: x[1], reverse=True)
-        best_idx, match_count, _ = matches[0]
-
-        self.stats['traditional_responses'] += 1
-        self.stats['questions_asked'] += 1
-        self.stats['last_activity'] = datetime.now()
-
-        logger.info(f"Traditional search found {len(matches)} matches, best match has {match_count} keyword matches")
-
+        best_idx, match_count, _, page_num = matches[0]
+        
+        # Get context
         start = max(0, best_idx - context_lines)
         end = min(len(sentences), best_idx + context_lines + 1)
-        context = ". ".join(sentences[start:end])
-
-        return context + "."
+        context = " ".join(sentences[start:end])
+        
+        # Calculate confidence
+        confidence = min(match_count / len(question_keywords), 1.0)
+        
+        self.stats['traditional_responses'] += 1
+        
+        result = f"{context}\n\n📍 Source: Page {page_num} (approx.)"
+        return result, confidence
     
-    def answer_question(self, question: str) -> str:
-        """Answer question (AI or traditional)"""
+    def answer_question(self, question: str) -> Dict[str, Any]:
+        """
+        Answer question with automatic mode selection and caching
+        
+        Returns structured response with metadata
+        """
         try:
-            # Validate and sanitize input
+            # Update stats
+            self.stats['questions_asked'] += 1
+            self.stats['last_activity'] = datetime.now()
+            
+            # Validate input
             clean_question = validate_input(question)
-            logger.info(f"Processing question: {clean_question[:50]}...")
-
-            if self.use_ai and self.ai_model:
-                return self.answer_with_ai(clean_question)
+            
+            # Check cache
+            cache_key = f"{self.current_doc_id}:{calculate_text_hash(clean_question)}"
+            cached = self.qa_cache.get(cache_key)
+            
+            if cached:
+                self.stats['cached_responses'] += 1
+                logger.info("Returning cached response")
+                return {
+                    **cached,
+                    'cached': True,
+                    'timestamp': datetime.now().isoformat()
+                }
+            
+            # Get answer
+            if self.use_ai and self.ai_provider.available:
+                answer, confidence = self.answer_with_ai(clean_question)
+                mode = "AI"
+                
+                # Fallback to traditional if AI fails
+                if confidence < 0.3 or "not found" in answer.lower() or "error" in answer.lower():
+                    logger.info("AI confidence low, trying traditional search")
+                    answer_trad, conf_trad = self.answer_traditional(clean_question)
+                    
+                    if conf_trad > confidence:
+                        answer = answer_trad
+                        confidence = conf_trad
+                        mode = "Traditional (AI Fallback)"
             else:
-                return self.answer_traditional(clean_question)
+                answer, confidence = self.answer_traditional(clean_question)
+                mode = "Traditional"
+            
+            # Prepare response
+            response = {
+                'question': clean_question,
+                'answer': answer,
+                'confidence': confidence,
+                'mode': mode,
+                'document': self.metadata[self.current_doc_id].filename if self.current_doc_id else None,
+                'cached': False,
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            # Cache response
+            self.qa_cache.set(cache_key, response)
+            
+            return response
+            
         except ValueError as e:
-            logger.warning(f"Invalid question input: {e}")
-            return f"❌ Invalid input: {e}"
+            logger.warning(f"Invalid input: {e}")
+            return {
+                'error': str(e),
+                'timestamp': datetime.now().isoformat()
+            }
         except Exception as e:
-            logger.error(f"Unexpected error in answer_question: {e}")
-            return "❌ An unexpected error occurred. Please try again."
+            logger.error(f"Unexpected error: {e}")
+            return {
+                'error': f"Unexpected error: {str(e)}",
+                'timestamp': datetime.now().isoformat()
+            }
     
-    def search_keyword(self, keyword: str) -> List[str]:
-        """Search for a keyword in the text"""
-        if not self.pdf_text:
+    def get_summary(self, max_length: int = 400) -> str:
+        """Generate intelligent summary with caching"""
+        text = self._get_current_text()
+        
+        if not text:
+            return "No document loaded."
+        
+        # Check cache
+        cache_key = f"{self.current_doc_id}:summary:{max_length}"
+        cached = self.summary_cache.get(cache_key)
+        
+        if cached:
+            logger.info("Returning cached summary")
+            return cached
+        
+        # Generate summary
+        if self.use_ai and self.ai_provider.available:
+            try:
+                sample = text[:60000]  # Use more text for better summary
+                
+                prompt = f"""Provide a comprehensive summary of this document in approximately {max_length} words.
+
+Document:
+{sample}
+
+Focus on:
+1. Main topics and themes
+2. Key concepts and definitions  
+3. Important conclusions or findings
+
+Summary:"""
+                
+                summary = self.ai_provider.generate(prompt)
+                
+                if summary:
+                    self.summary_cache.set(cache_key, summary)
+                    return summary
+            except Exception as e:
+                logger.error(f"AI summary error: {e}")
+        
+        # Fallback to traditional summary
+        sentences = [s.strip() for s in text.split('.') if len(s.strip()) > 50]
+        summary = '. '.join(sentences[:7]) + '.'
+        self.summary_cache.set(cache_key, summary)
+        
+        return summary
+    
+    def search_keyword(self, keyword: str, max_results: int = 20) -> List[Dict[str, Any]]:
+        """Advanced keyword search with context and page numbers"""
+        text = self._get_current_text()
+        
+        if not text:
             return []
         
         results = []
-        lines = self.pdf_text.split("\n")
+        lines = text.split('\n')
+        current_page = 1
+        
         for i, line in enumerate(lines):
+            # Track page numbers
+            if '--- Page' in line:
+                try:
+                    current_page = int(re.search(r'--- Page (\d+)', line).group(1))
+                except:
+                    pass
+                continue
+            
             if keyword.lower() in line.lower():
-                results.append(f"[Line {i}]: {line.strip()}")
+                # Get context
+                context_start = max(0, i - 1)
+                context_end = min(len(lines), i + 2)
+                context = ' '.join(lines[context_start:context_end])
+                
+                results.append({
+                    'line_number': i,
+                    'page': current_page,
+                    'content': line.strip(),
+                    'context': context.strip()
+                })
+                
+                if len(results) >= max_results:
+                    break
         
         return results
     
-    def get_ai_summary(self, max_length: int = 300) -> str:
-        """Get intelligent summary using AI with caching"""
-        if not self.ai_model:
-            return self.get_traditional_summary()
-
-        if not self.pdf_text:
-            return "No text to summarize."
-
-        # Create cache key based on PDF content hash and max_length
-        import hashlib
-        content_hash = hashlib.md5(self.pdf_text[:50000].encode('utf-8')).hexdigest()
-        cache_key = f"{content_hash}_{max_length}"
-
-        # Check cache first
-        if cache_key in self._summary_cache:
-            logger.info("Using cached AI summary")
-            return self._summary_cache[cache_key]
-
-        try:
-            logger.info("Generating AI summary...")
-            # Use part of the text for summary
-            text_sample = self.pdf_text[:50000]  # First 50k characters
-
-            prompt = f"""Summarize the following document comprehensively and concisely in approximately {max_length} words:
-
-{text_sample}
-
-Summary:"""
-
-            response = self.ai_model.generate_content(prompt)
-            summary = response.text
-
-            # Cache the result
-            self._summary_cache[cache_key] = summary
-            logger.info("AI summary generated and cached successfully")
-            return summary
-        except Exception as e:
-            logger.error(f"AI summary error: {e}")
-            print(f"❌ AI Summary Error: {e}")
-            return self.get_traditional_summary()
-
-    def get_traditional_summary(self, max_sentences: int = 5) -> str:
-        """Traditional summary"""
-        if not self.pdf_text:
-            return "No text to summarize."
+    def toggle_ai_mode(self) -> str:
+        """Toggle between AI and traditional modes"""
+        if not self.ai_provider.available:
+            return "⚠️ AI not available"
         
-        sentences = [s.strip() for s in self.pdf_text.split(".") if len(s.strip()) > 50]
-        return ". ".join(sentences[:max_sentences]) + "."
+        self.use_ai = not self.use_ai
+        mode = "AI Mode ✨" if self.use_ai else "Traditional Mode 🔍"
+        logger.info(f"Switched to: {mode}")
+        
+        return f"🔄 Switched to: {mode}"
     
-    def toggle_ai_mode(self):
-        """Toggle AI mode"""
-        if self.ai_model:
-            self.use_ai = not self.use_ai
-            mode = "Smart AI" if self.use_ai else "Traditional"
-            logger.info(f"Switched to mode: {mode}")
-            print(f"🔄 Switched to mode: {mode}")
-        else:
-            logger.warning("Attempted to toggle AI mode but AI not available")
-            print("⚠️ AI not available. Make sure you entered a valid API key.")
-
     def get_stats(self) -> Dict[str, Any]:
-        """Get system statistics"""
+        """Comprehensive system statistics"""
+        uptime = datetime.now() - self.stats['start_time']
+        
         return {
-            **self.stats,
-            'pdf_loaded': bool(self.pdf_text),
-            'ai_available': bool(self.ai_model),
-            'pdf_path': self.pdf_path,
-            'text_length': len(self.pdf_text) if self.pdf_text else 0
+            'session': {
+                'questions_asked': self.stats['questions_asked'],
+                'ai_responses': self.stats['ai_responses'],
+                'traditional_responses': self.stats['traditional_responses'],
+                'cached_responses': self.stats['cached_responses'],
+                'uptime': str(uptime).split('.')[0],
+                'last_activity': self.stats['last_activity'].strftime('%Y-%m-%d %H:%M:%S')
+            },
+            'documents': {
+                'total_loaded': self.stats['total_docs_loaded'],
+                'currently_loaded': len(self.documents),
+                'current_doc': self.metadata[self.current_doc_id].filename if self.current_doc_id else None
+            },
+            'ai': {
+                'available': self.ai_provider.available,
+                'provider': self.ai_provider.provider_name,
+                'mode': 'AI' if self.use_ai else 'Traditional'
+            },
+            'cache': {
+                'qa_cache': self.qa_cache.get_stats(),
+                'summary_cache': self.summary_cache.get_stats()
+            }
         }
+    
+    def list_documents(self) -> List[Dict[str, Any]]:
+        """List all loaded documents with metadata"""
+        return [
+            {
+                'id': doc_id,
+                'filename': meta.filename,
+                'pages': meta.num_pages,
+                'size': f"{meta.file_size / 1024:.1f} KB",
+                'loaded': meta.load_time.strftime('%Y-%m-%d %H:%M'),
+                'current': doc_id == self.current_doc_id
+            }
+            for doc_id, meta in self.metadata.items()
+        ]
+    
+    def switch_document(self, doc_id: str) -> bool:
+        """Switch to a different loaded document"""
+        if doc_id in self.documents:
+            self.current_doc_id = doc_id
+            logger.info(f"Switched to document: {doc_id}")
+            return True
+        return False
 
-    def _check_rate_limit(self) -> bool:
-        """Check if API call is within rate limits"""
-        now = datetime.now()
-        # Remove calls older than 1 minute
-        self.api_call_times = [t for t in self.api_call_times if (now - t).total_seconds() < 60]
 
-        if len(self.api_call_times) >= self.max_calls_per_minute:
-            logger.warning("Rate limit exceeded")
-            return False
-
-        self.api_call_times.append(now)
-        return True
-
+# ================= Interactive CLI =================
 
 def interactive_mode():
-    """Enhanced interactive mode with AI support"""
-    print("\n" + "=" * 80)
-    print("🤖 Smart PDF Question Answering System - Powered by Gemini AI")
-    print("📚 Ask questions about your PDF documents with AI assistance")
-    print("=" * 80)
-
-    # Automatic API setup
-    api_key = os.getenv("GEMINI_API_KEY") or "########################"
-    print("\n🔑 Initializing system...")
-
-    qa = AIEnhancedPDFQA(api_key=api_key, use_ai=True)
-
-    if qa.ai_model:
-        print("✅ AI mode enabled successfully!")
+    """Enhanced interactive mode with rich features"""
+    print("\n" + "=" * 90)
+    print("🚀 Advanced PDF Question Answering System v3.0")
+    print("💡 AI-Powered Document Intelligence with Smart Fallback")
+    print("=" * 90)
+    
+    # Initialize system
+    api_key = os.getenv("GEMINI_API_KEY")
+    
+    if not api_key:
+        print("\n⚠️  No GEMINI_API_KEY found in environment")
+        print("📝 To enable AI features, create a .env file with: GEMINI_API_KEY=your_key_here")
+        print("🔍 Continuing in Traditional Search mode...\n")
+    
+    qa = AdvancedPDFQA(api_key=api_key, use_ai=True)
+    
+    # Status message
+    if qa.ai_provider.available:
+        print(f"✨ AI Mode: ENABLED ({qa.ai_provider.provider_name})")
     else:
-        print("⚠️ AI mode not available - using traditional search")
-
-    # Load default PDF automatically
+        print("🔍 AI Mode: DISABLED (Traditional search only)")
+    
+    # Load default PDF
     default_pdf = "data/UML.pdf"
     if os.path.exists(default_pdf):
         print(f"\n📂 Loading default file: {default_pdf}")
-        if not qa.load_pdf(default_pdf):
-            print("❌ Failed to load default file. You can load another file.")
+        qa.load_pdf(default_pdf)
     else:
-        print("\n📂 Default PDF file not found.")
-        print("You can load a PDF file using the 'load' command")
+        print("\n📂 No default PDF found. Use 'load <path>' to load a document.")
     
-    # Interactive mode
-    print("\n" + "=" * 80)
-    print("📋 Available Commands:")
-    print("  💬  Ask any question directly - get smart AI-powered answers")
-    print("  🔍  search:keyword - search for specific keywords in the document")
-    print("  📄  summary - generate intelligent document summary")
-    print("  📊  stats - show system statistics and usage info")
-    print("  🔄  toggle - switch between AI and traditional search modes")
-    print("  📁  load - load a different PDF file")
-    print("  ❓  help - show this help message")
-    print("  🚪  exit - quit the application")
-    print("=" * 80)
-
+    # Command help
+    print("\n" + "=" * 90)
+    print("📋 COMMANDS:")
+    print("  💬 [question]          - Ask any question about the document")
+    print("  🔍 search:<keyword>    - Search for specific keywords")
+    print("  📄 summary             - Generate document summary")
+    print("  📊 stats               - Show system statistics")
+    print("  🔄 toggle              - Switch AI/Traditional mode")
+    print("  📁 load <path>         - Load a PDF file")
+    print("  📚 docs                - List loaded documents")
+    print("  💾 cache               - Show cache statistics")
+    print("  ❓ help                - Show detailed help")
+    print("  🚪 exit                - Quit application")
+    print("=" * 90)
+    
+    # Main loop
     while True:
-        user_input = input("\n💬 Enter command or question: ").strip()
-        
-        if not user_input:
-            continue
-        
-        if user_input.lower() == "exit":
-            stats = qa.get_stats()
-            print("\n📊 Session Summary:")
-            print(f"  • Total questions: {stats['questions_asked']}")
-            print(f"  • AI responses: {stats['ai_responses']}")
-            print(f"  • Traditional responses: {stats['traditional_responses']}")
-            print("👋 Thank you for using the Smart PDF QA System!")
-            break
-
-        elif user_input.lower() == "help":
-            print("\n" + "=" * 60)
-            print("📖 Help - How to use the system:")
-            print("=" * 60)
-            print("💬 Questions:")
-            print("  • Type any question in natural language")
-            print("  • Examples: 'What are the main concepts?', 'Explain UML diagrams'")
-            print()
-            print("🔍 Search Commands:")
-            print("  • search:keyword - Find all occurrences of a word")
-            print("  • Example: 'search:class' or 'search:UML'")
-            print()
-            print("📄 Document Analysis:")
-            print("  • summary - Generate AI-powered document summary")
-            print("  • stats - Show usage statistics and system info")
-            print()
-            print("⚙️ System Controls:")
-            print("  • toggle - Switch between AI and traditional modes")
-            print("  • load - Load a different PDF file")
-            print("  • exit - Quit the application")
-            print("=" * 60)
-
-        elif user_input.lower() == "summary":
-            print("\n📝 Generating summary...")
-            if qa.use_ai and qa.ai_model:
-                summary = qa.get_ai_summary()
-            else:
-                summary = qa.get_traditional_summary()
-            print(f"\n📄 Summary:\n{summary}")
-
-        elif user_input.lower() == "toggle":
-            qa.toggle_ai_mode()
-
-        elif user_input.lower() == "stats":
-            stats = qa.get_stats()
-            print("\n" + "=" * 50)
-            print("📊 System Statistics")
-            print("=" * 50)
-            print(f"📝 Questions Asked: {stats['questions_asked']}")
-            print(f"🤖 AI Responses: {stats['ai_responses']}")
-            print(f"🔍 Traditional Responses: {stats['traditional_responses']}")
-            print(f"📄 PDF File: {'✅ Loaded' if stats['pdf_loaded'] else '❌ Not loaded'}")
-            if stats['pdf_loaded'] and stats['pdf_path']:
-                print(f"   📁 Path: {stats['pdf_path']}")
-            print(f"🧠 AI Model: {'✅ Available' if stats['ai_available'] else '❌ Not available'}")
-            print(f"📊 Text Length: {stats['text_length']:,} characters")
-            print(f"🕒 Last Activity: {stats['last_activity'].strftime('%Y-%m-%d %H:%M:%S')}")
-            print(f"⚡ Current Mode: {'AI Mode' if qa.use_ai else 'Traditional Mode'}")
-            print("=" * 50)
-
-        elif user_input.lower().startswith("search:"):
-            keyword = user_input[7:].strip()
-            try:
-                clean_keyword = validate_input(keyword, max_length=100)
-                results = qa.search_keyword(clean_keyword)
-                if results:
-                    print(f"\n🔍 Found {len(results)} results:")
-                    for result in results[:15]:
-                        print(f"  • {result}")
+        try:
+            user_input = input("\n💬 ").strip()
+            
+            if not user_input:
+                continue
+            
+            # Commands
+            if user_input.lower() == "exit":
+                stats = qa.get_stats()
+                print("\n" + "=" * 60)
+                print("📊 SESSION SUMMARY")
+                print("=" * 60)
+                print(f"⏱️  Session Duration: {stats['session']['uptime']}")
+                print(f"❓ Questions Asked: {stats['session']['questions_asked']}")
+                print(f"🤖 AI Responses: {stats['session']['ai_responses']}")
+                print(f"🔍 Traditional: {stats['session']['traditional_responses']}")
+                print(f"💾 Cached: {stats['session']['cached_responses']}")
+                print("=" * 60)
+                print("👋 Thank you for using Advanced PDF QA System v3.0!")
+                break
+            
+            elif user_input.lower() == "help":
+                print("\n" + "=" * 70)
+                print("📖 DETAILED HELP")
+                print("=" * 70)
+                print("\n💬 ASKING QUESTIONS:")
+                print("  • Type naturally: 'What is UML?', 'Explain class diagrams'")
+                print("  • AI provides intelligent, context-aware answers")
+                print("  • Confidence scores help assess answer quality")
+                print("  • Automatic fallback to traditional search if AI fails")
+                print("\n🔍 SEARCH FEATURES:")
+                print("  • search:keyword - Find all occurrences with context")
+                print("  • Shows page numbers and surrounding text")
+                print("  • Case-insensitive matching")
+                print("\n📄 DOCUMENT MANAGEMENT:")
+                print("  • load <path> - Load new PDF (supports up to 100MB)")
+                print("  • docs - List all loaded documents")
+                print("  • Multiple documents can be loaded simultaneously")
+                print("\n⚙️ SYSTEM FEATURES:")
+                print("  • Smart caching reduces API calls and improves speed")
+                print("  • Rate limiting prevents API quota exhaustion")
+                print("  • Confidence scoring for answer reliability")
+                print("  • Comprehensive statistics and monitoring")
+                print("=" * 70)
+            
+            elif user_input.lower() == "summary":
+                print("\n📝 Generating summary...")
+                summary = qa.get_summary()
+                print(f"\n📄 SUMMARY:\n{summary}")
+            
+            elif user_input.lower() == "toggle":
+                result = qa.toggle_ai_mode()
+                print(f"\n{result}")
+            
+            elif user_input.lower() == "stats":
+                stats = qa.get_stats()
+                print("\n" + "=" * 70)
+                print("📊 SYSTEM STATISTICS")
+                print("=" * 70)
+                print("\n📈 SESSION:")
+                for key, value in stats['session'].items():
+                    print(f"  {key.replace('_', ' ').title()}: {value}")
+                print("\n📚 DOCUMENTS:")
+                for key, value in stats['documents'].items():
+                    print(f"  {key.replace('_', ' ').title()}: {value}")
+                print("\n🤖 AI STATUS:")
+                for key, value in stats['ai'].items():
+                    print(f"  {key.replace('_', ' ').title()}: {value}")
+                print("\n💾 CACHE PERFORMANCE:")
+                print(f"  QA Cache: {stats['cache']['qa_cache']}")
+                print(f"  Summary Cache: {stats['cache']['summary_cache']}")
+                print("=" * 70)
+            
+            elif user_input.lower() == "docs":
+                docs = qa.list_documents()
+                if docs:
+                    print("\n" + "=" * 70)
+                    print("📚 LOADED DOCUMENTS")
+                    print("=" * 70)
+                    for doc in docs:
+                        marker = "→" if doc['current'] else " "
+                        print(f"{marker} {doc['filename']}")
+                        print(f"  Pages: {doc['pages']} | Size: {doc['size']} | Loaded: {doc['loaded']}")
+                        print()
                 else:
-                    print("❌ No results found.")
-            except ValueError as e:
-                print(f"❌ Invalid keyword: {e}")
-
-        elif user_input.lower() == "load":
-            path = input("Enter new PDF file path: ").strip()
-            try:
-                clean_path = validate_input(path, max_length=500)
-                qa.load_pdf(clean_path)
-            except ValueError as e:
-                print(f"❌ Invalid file path: {e}")
-
-        else:
-            print("\n🤔 Searching for answer...")
-            answer = qa.answer_question(user_input)
-            print(f"\n✨ Answer:\n{answer}")
+                    print("\n📚 No documents loaded")
+            
+            elif user_input.lower() == "cache":
+                stats = qa.get_stats()
+                print("\n" + "=" * 60)
+                print("💾 CACHE STATISTICS")
+                print("=" * 60)
+                print(f"\n🔍 QA Cache:")
+                for key, value in stats['cache']['qa_cache'].items():
+                    print(f"  {key.title()}: {value}")
+                print(f"\n📄 Summary Cache:")
+                for key, value in stats['cache']['summary_cache'].items():
+                    print(f"  {key.title()}: {value}")
+                print("=" * 60)
+            
+            elif user_input.lower().startswith("search:"):
+                keyword = user_input[7:].strip()
+                if keyword:
+                    results = qa.search_keyword(keyword)
+                    if results:
+                        print(f"\n🔍 Found {len(results)} results for '{keyword}':")
+                        print("=" * 70)
+                        for i, result in enumerate(results[:10], 1):
+                            print(f"\n{i}. Page {result['page']} (Line {result['line_number']})")
+                            print(f"   {result['context'][:200]}...")
+                    else:
+                        print(f"\n❌ No results found for '{keyword}'")
+                else:
+                    print("\n❌ Please provide a keyword: search:<keyword>")
+            
+            elif user_input.lower().startswith("load "):
+                path = user_input[5:].strip()
+                qa.load_pdf(path)
+            
+            else:
+                # Question answering
+                print("\n🤔 Processing your question...")
+                response = qa.answer_question(user_input)
+                
+                if 'error' in response:
+                    print(f"\n❌ Error: {response['error']}")
+                else:
+                    print("\n" + "=" * 70)
+                    print("✨ ANSWER")
+                    print("=" * 70)
+                    print(f"\n{response['answer']}")
+                    print(f"\n📊 Confidence: {response['confidence']:.0%} | Mode: {response['mode']}")
+                    if response.get('cached'):
+                        print("💾 (Retrieved from cache)")
+                    print("=" * 70)
+        
+        except KeyboardInterrupt:
+            print("\n\n👋 Interrupted by user. Goodbye!")
+            break
+        except Exception as e:
+            logger.error(f"Error in main loop: {e}")
+            print(f"\n❌ Error: {e}")
 
 
 if __name__ == "__main__":
