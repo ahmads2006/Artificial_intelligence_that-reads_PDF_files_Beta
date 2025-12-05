@@ -218,11 +218,7 @@ class AIProvider:
             except Exception as e:
                 logger.warning(f"AI generation attempt {attempt + 1} failed: {e}")
                 if attempt < max_retries - 1:
-<<<<<<< HEAD
                     time.sleep(2 ** attempt)  # Exponential backoff
-=======
-                    asyncio.sleep(2 ** attempt)  # Exponential backoff
->>>>>>> 8e045184035f5db653e96a171f568d2ec4253a9b
         
         return None
 
