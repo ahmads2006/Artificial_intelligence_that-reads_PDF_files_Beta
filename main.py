@@ -1,11 +1,5 @@
 import PyPDF2
 import os
-import logging
-import asyncio
-import hashlib
-import json
-import time
-from functools import lru_cache
 from dotenv import load_dotenv
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime, timedelta
@@ -14,238 +8,28 @@ from pathlib import Path
 import re
 
 load_dotenv()
+import google.generativeai as genai
+from typing import List, Optional
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('pdf_qa_v3.log', encoding='utf-8'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
-
-# ================= Data Classes =================
-
-@dataclass
-class SearchResult:
-    """Structured search result"""
-    content: str
-    confidence: float
-    page_number: int
-    match_type: str  # 'exact', 'semantic', 'keyword'
-    metadata: Dict[str, Any]
-
-@dataclass
-class DocumentMetadata:
-    """PDF document metadata"""
-    filename: str
-    num_pages: int
-    text_length: int
-    load_time: datetime
-    file_size: int
-    hash: str
-
-# ================= Helper Functions =================
-
-def validate_input(text: str, max_length: int = 2000) -> str:
-    """Enhanced input validation"""
-    if not text or not text.strip():
-        raise ValueError("Input cannot be empty")
-
-    sanitized = ''.join(char for char in text if char.isprintable()).strip()
-
-    # Check that sanitization didn't result in empty string
-    if not sanitized:
-        raise ValueError("Input cannot contain only non-printable characters")
-
-    if len(sanitized) > max_length:
-        logger.warning(f"Input truncated from {len(sanitized)} to {max_length}")
-        sanitized = sanitized[:max_length]
-
-    return sanitized
-
-def validate_file_path(file_path: str) -> Tuple[bool, str]:
-    """Enhanced file validation with detailed error messages"""
-    if not file_path:
-        return False, "File path is empty"
-    
-    path = Path(file_path)
-    
-    if not path.exists():
-        return False, f"File does not exist: {file_path}"
-    
-    if not path.suffix.lower() == '.pdf':
-        return False, f"File is not a PDF: {path.suffix}"
-    
-    max_size = 100 * 1024 * 1024  # 100MB (increased from 50MB)
-    file_size = path.stat().st_size
-    
-    if file_size > max_size:
-        return False, f"File too large: {file_size / (1024*1024):.1f}MB (max 100MB)"
-    
-    if file_size == 0:
-        return False, "File is empty"
-    
-    return True, "Valid"
-
-def calculate_text_hash(text: str) -> str:
-    """Calculate SHA256 hash of text"""
-    return hashlib.sha256(text.encode('utf-8')).hexdigest()[:16]
-
-def extract_keywords(text: str, min_length: int = 3) -> List[str]:
-    """Extract meaningful keywords from text"""
-    # Remove common stop words
-    stop_words = {'the', 'is', 'at', 'which', 'on', 'and', 'or', 'but', 'in', 'with', 'to', 'for', 'of', 'a', 'an'}
-    words = re.findall(r'\b\w+\b', text.lower())
-    return [w for w in words if len(w) >= min_length and w not in stop_words]
-
-# ================= Advanced Caching System =================
-
-class SmartCache:
-    """LRU cache with TTL and size limits"""
-    
-    def __init__(self, max_size: int = 100, ttl_seconds: int = 3600):
-        self.cache: Dict[str, Tuple[Any, datetime]] = {}
-        self.max_size = max_size
-        self.ttl = timedelta(seconds=ttl_seconds)
-        self.hits = 0
-        self.misses = 0
-    
-    def get(self, key: str) -> Optional[Any]:
-        """Get cached value if not expired"""
-        if key in self.cache:
-            value, timestamp = self.cache[key]
-            if datetime.now() - timestamp < self.ttl:
-                self.hits += 1
-                logger.debug(f"Cache hit for key: {key[:20]}...")
-                return value
-            else:
-                del self.cache[key]
+class AIEnhancedPDFQA:
+    def __init__(self, pdf_path=None, api_key=None, use_ai=True):
+        """
+        Advanced PDF Question Answering System with AI
         
-        self.misses += 1
-        return None
-    
-    def set(self, key: str, value: Any):
-        """Set cached value with timestamp"""
-        if len(self.cache) >= self.max_size:
-            # Remove oldest entry
-            oldest_key = min(self.cache.keys(), key=lambda k: self.cache[k][1])
-            del self.cache[oldest_key]
+        Args:
+            pdf_path: Path to PDF file (optional)
+            api_key: Gemini API key (optional)
+            use_ai: Use AI or traditional search
+        """
+        self.pdf_text = ""
+        self.pdf_path = pdf_path
+        self.use_ai = use_ai
+        self.ai_model = None
         
-        self.cache[key] = (value, datetime.now())
-        logger.debug(f"Cached key: {key[:20]}...")
-    
-    def clear(self):
-        """Clear all cache"""
-        self.cache.clear()
-        logger.info("Cache cleared")
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """Get cache statistics"""
-        total = self.hits + self.misses
-        hit_rate = (self.hits / total * 100) if total > 0 else 0
-        return {
-            'hits': self.hits,
-            'misses': self.misses,
-            'hit_rate': f"{hit_rate:.1f}%",
-            'size': len(self.cache)
-        }
-
-# ================= AI Integration with Fallback =================
-
-class AIProvider:
-    """Abstract AI provider with fallback support"""
-    
-    def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key
-        self.model = None
-        self.available = False
-        self.provider_name = "None"
+        # Initialize AI model
+        if use_ai and api_key:
+            self._initialize_ai(api_key)
         
-        if api_key:
-            self._initialize()
-    
-    def _initialize(self):
-        """Initialize AI model"""
-        try:
-            import google.generativeai as genai
-            genai.configure(api_key=self.api_key)
-            self.model = genai.GenerativeModel('gemini-2.0-flash-exp')
-            self.available = True
-            self.provider_name = "Gemini 2.0 Flash"
-            logger.info(f"AI Provider initialized: {self.provider_name}")
-        except ImportError:
-            logger.warning("google.generativeai not installed")
-        except Exception as e:
-            logger.error(f"AI initialization failed: {e}")
-    
-    def generate(self, prompt: str, max_retries: int = 3) -> Optional[str]:
-        """Generate response with retry logic"""
-        if not self.available:
-            return None
-        
-        for attempt in range(max_retries):
-            try:
-                response = self.model.generate_content(prompt)
-                return response.text
-            except Exception as e:
-                logger.warning(f"AI generation attempt {attempt + 1} failed: {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)  # Exponential backoff
-        
-        return None
-
-# ================= Main Enhanced PDF QA Class =================
-
-class AdvancedPDFQA:
-    """
-    Advanced PDF Question Answering System v3.0
-    
-    Features:
-    - Dual AI/Traditional modes with smart fallback
-    - Advanced caching system with TTL
-    - Multi-document support with metadata
-    - Confidence scoring for answers
-    - Enhanced search with semantic understanding
-    - Comprehensive statistics and monitoring
-    - Rate limiting with exponential backoff
-    - Async-ready architecture
-    """
-    
-    def __init__(self, pdf_path: Optional[str] = None, api_key: Optional[str] = None, use_ai: bool = True):
-        logger.info("Initializing AdvancedPDFQA v3.0")
-        
-        # Core attributes
-        self.documents: Dict[str, str] = {}  # {doc_id: text}
-        self.metadata: Dict[str, DocumentMetadata] = {}
-        self.current_doc_id: Optional[str] = None
-        
-        # AI provider
-        self.ai_provider = AIProvider(api_key)
-        self.use_ai = use_ai and self.ai_provider.available
-        
-        # Caching system
-        self.qa_cache = SmartCache(max_size=200, ttl_seconds=3600)
-        self.summary_cache = SmartCache(max_size=50, ttl_seconds=7200)
-        
-        # Statistics
-        self.stats = {
-            'questions_asked': 0,
-            'ai_responses': 0,
-            'traditional_responses': 0,
-            'cached_responses': 0,
-            'total_docs_loaded': 0,
-            'start_time': datetime.now(),
-            'last_activity': datetime.now()
-        }
-        
-        # Rate limiting
-        self.api_call_times: List[datetime] = []
-        self.max_calls_per_minute = 15
-        
-        # Load initial PDF if provided
         if pdf_path:
             self.load_pdf(pdf_path)
         
