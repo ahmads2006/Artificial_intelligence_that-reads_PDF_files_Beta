@@ -89,6 +89,9 @@ class AIEnhancedPDFQA:
         self.api_call_times = []
         self.max_calls_per_minute = 10
 
+        # Cache for summaries to avoid regenerating for same content
+        self._summary_cache = {}
+
         # Initialize AI model
         if use_ai and api_key:
             self._initialize_ai(api_key)
@@ -136,6 +139,8 @@ class AIEnhancedPDFQA:
                     self.pdf_text += f"\n--- Page {page_num + 1} ---\n{page_text}\n"
 
             self.pdf_path = path
+            # Clear summary cache since we have new content
+            self._summary_cache.clear()
             logger.info(f"Successfully loaded PDF with {len(reader.pages)} pages")
             print(f"✔ Loaded {len(reader.pages)} pages from file")
             return True
@@ -383,7 +388,6 @@ Do you find an answer to the question in this part? If yes, answer accurately. I
         
         return results
     
-    @lru_cache(maxsize=5)  # Cache last 5 summaries
     def get_ai_summary(self, max_length: int = 300) -> str:
         """Get intelligent summary using AI with caching"""
         if not self.ai_model:
@@ -391,6 +395,16 @@ Do you find an answer to the question in this part? If yes, answer accurately. I
 
         if not self.pdf_text:
             return "No text to summarize."
+
+        # Create cache key based on PDF content hash and max_length
+        import hashlib
+        content_hash = hashlib.md5(self.pdf_text[:50000].encode('utf-8')).hexdigest()
+        cache_key = f"{content_hash}_{max_length}"
+
+        # Check cache first
+        if cache_key in self._summary_cache:
+            logger.info("Using cached AI summary")
+            return self._summary_cache[cache_key]
 
         try:
             logger.info("Generating AI summary...")
@@ -404,8 +418,12 @@ Do you find an answer to the question in this part? If yes, answer accurately. I
 Summary:"""
 
             response = self.ai_model.generate_content(prompt)
-            logger.info("AI summary generated successfully")
-            return response.text
+            summary = response.text
+
+            # Cache the result
+            self._summary_cache[cache_key] = summary
+            logger.info("AI summary generated and cached successfully")
+            return summary
         except Exception as e:
             logger.error(f"AI summary error: {e}")
             print(f"❌ AI Summary Error: {e}")
@@ -444,7 +462,7 @@ Summary:"""
         """Check if API call is within rate limits"""
         now = datetime.now()
         # Remove calls older than 1 minute
-        self.api_call_times = [t for t in self.api_call_times if (now - t).seconds < 60]
+        self.api_call_times = [t for t in self.api_call_times if (now - t).total_seconds() < 60]
 
         if len(self.api_call_times) >= self.max_calls_per_minute:
             logger.warning("Rate limit exceeded")
