@@ -4,6 +4,7 @@ import logging
 import asyncio
 import hashlib
 import json
+import time
 from functools import lru_cache
 from dotenv import load_dotenv
 from typing import List, Dict, Any, Optional, Tuple
@@ -192,7 +193,7 @@ class AIProvider:
             except Exception as e:
                 logger.warning(f"AI generation attempt {attempt + 1} failed: {e}")
                 if attempt < max_retries - 1:
-                    asyncio.sleep(2 ** attempt)  # Exponential backoff
+                    time.sleep(2 ** attempt)  # Exponential backoff
         
         return None
 
